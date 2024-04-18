@@ -1,4 +1,4 @@
-name: Test junyper notebook
+name: Run Tests
 on:
   workflow_call:
     inputs:
@@ -11,11 +11,18 @@ on:
         required: true
       port:
         type: string
+      secondary-image:
+        type: string
+        required: false
+        description: "Secondary image to run"
+        default: "joshxt/safeexecute:latest"
+      secondary-image-port:
+        type: string
+        required: false
+        description: "Port for the secondary image"
+        default: "5432"
       port-mapping:
         type: string
-      image-options:
-        type: string
-        description: like --entrypoint, --command
       additional-python-dependencies:
         type: string
         description: add whatever pip you need here
@@ -30,33 +37,91 @@ on:
       append-logs:
         type: boolean
         default: false
-
+      clone-repo:
+        type: boolean
+        default: false
+      database-type:
+        type: string
+        default: "postgresql"
+        description: "Database type to use"
+      db-connected:
+        type: boolean
+        default: true
+        description: "If the database is connected"
+      report-name:
+        type: string
+        default: "test-reports"
+        description: "Name of the report"
+      auth-schema:
+        type: string
+        description: schema to use for authentication
+        default: company
+      sendgrid-api-key:
+        type: string
+        default: none
+        description: Optional sendgrid api-key available as os.getenv('SENDGRID_API_KEY') in your notebook
+      default-email:
+        type: string
+        default: none
+        description: Optional default email available as os.getenv('DEFAULT_EMAIL') in your notebook
     secrets:
       api-key:
         description: Optional api-key available as os.getenv('API_KEY') in your notebook
 
 jobs:
-  jupyter-test-job:
+  run-tests:
     runs-on: ubuntu-latest
-    #    container: python:3.10-slim-buster
-
     outputs:
       digest: ${{ steps.dockerBuild.outputs.digest }}
     services:
+      dbservice:
+        image: postgres:latest
+        ports:
+          - 5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+      secondary-service:
+        image: ${{ inputs.secondary-image }}
+        ports:
+          - ${{ inputs.secondary-image-port }}
+        env:
+          DB_CONNECTED: ${{ inputs.db-connected }}
+          DATABASE_TYPE: ${{ inputs.database-type }}
+          DATABASE_HOST: dbservice
+          DATABASE_USER: postgres
+          DATABASE_PASSWORD: postgres
+          DATABASE_PORT: 5432
+          DATABASE_NAME: postgres
+          SCHEMA: ${{ inputs.auth-schema }}
+          LOG_LEVEL: DEBUG
+          MFA_VERIFY: authenticator
       service-under-test:
         image: ${{ inputs.image }}
         ports:
           - ${{ inputs.port-mapping || format('{0}:{1}', inputs.port, inputs.port) }}
-    #        options: ${{ inputs.image-options }}
-    #     volumes:
-    #       - /models:/models
+        env:
+          DB_CONNECTED: ${{ inputs.db-connected }}
+          DATABASE_TYPE: ${{ inputs.database-type }}
+          DATABASE_HOST: dbservice
+          DATABASE_USER: postgres
+          DATABASE_PASSWORD: postgres
+          DATABASE_PORT: 5432
+          DATABASE_NAME: postgres
+          SCHEMA: ${{ inputs.auth-schema }}
+          LOG_LEVEL: DEBUG
+          SENDGRID_API_KEY: ${{ inputs.sendgrid-api-key }}
+          DEFAULT_EMAIL: ${{ inputs.default-email }}
+          DEFAULT_SERVICE: sendgrid
+          MFA_VERIFY: authenticator
 
     steps:
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4.1.1
         with:
           fetch-depth: 1
 
@@ -66,6 +131,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --fix-missing -y pandoc texlive-xetex texlive-fonts-recommended texlive-plain-generic
+
+      - name: Clone repository and install package
+        if: inputs.clone-repo
+        run: |
+          git clone https://github.com/${{ github.repository }} /tmp/repo
+          cd /tmp/repo
+          pip3 install .
 
       - name: Install additional dependencies for notebooks
         if: inputs.additional-python-dependencies
@@ -108,7 +180,7 @@ jobs:
         run: |
           echo "artifact-file=${{ env.artifact-file }}\n/test-output.log" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
-          name: test-reports
+          name: ${{ inputs.report-name }}
           path: ${{ env.artifact-file }}

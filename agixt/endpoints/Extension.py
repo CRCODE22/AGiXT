@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Header
 from Extensions import Extensions
 from ApiClient import Agent, log_interaction, verify_api_key, get_api_client
 from Models import CommandExecution
+import logging
 
 
 app = APIRouter()
@@ -45,6 +46,7 @@ async def run_command(
     user=Depends(verify_api_key),
     authorization: str = Header(None),
 ):
+    logging.info(f"Autorization: {authorization}")
     ApiClient = get_api_client(authorization=authorization)
     agent_config = Agent(
         agent_name=agent_name, user=user, ApiClient=ApiClient
@@ -54,6 +56,7 @@ async def run_command(
         agent_config=agent_config,
         conversation_name=command.conversation_name,
         ApiClient=ApiClient,
+        api_key=authorization,
         user=user,
     ).execute_command(
         command_name=command.command_name, command_args=command.command_args

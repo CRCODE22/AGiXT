@@ -19,12 +19,14 @@ class Extensions:
         agent_config=None,
         conversation_name="",
         ApiClient=None,
+        api_key=None,
         user=DEFAULT_USER,
     ):
         self.agent_config = agent_config
         self.agent_name = agent_name if agent_name else "gpt4free"
         self.conversation_name = conversation_name
         self.ApiClient = ApiClient
+        self.api_key = api_key
         self.commands = self.load_commands()
         self.user = user
         if agent_config != None:
@@ -49,11 +51,7 @@ class Extensions:
                 "commands" in self.agent_config
                 and friendly_name in self.agent_config["commands"]
             ):
-                if (
-                    self.agent_config["commands"][friendly_name] == "true"
-                    or self.agent_config["commands"][friendly_name] == True
-                ):
-                    # Add command to list of commands to return
+                if str(self.agent_config["commands"][friendly_name]).lower() == "true":
                     available_commands.append(
                         {
                             "friendly_name": friendly_name,
@@ -147,25 +145,6 @@ class Extensions:
         return commands_list
 
     async def execute_command(self, command_name: str, command_args: dict = None):
-        if command_args:
-            if "is_m4a_audio" in command_args or "is_wav_audio" in command_args:
-                new_command_args = {}
-                for arg in command_args:
-                    if "is_m4a_audio" in command_args:
-                        if arg == command_args["is_m4a_audio"]:
-                            new_command_args[arg] = await self.execute_command(
-                                command_name="Transcribe M4A Audio",
-                                command_args={"base64_audio": command_args[arg]},
-                            )
-                    if "is_wav_audio" in command_args:
-                        if arg == command_args["is_wav_audio"]:
-                            new_command_args[arg] = await self.execute_command(
-                                command_name="Transcribe WAV Audio",
-                                command_args={"base64_audio": command_args[arg]},
-                            )
-                    if arg not in new_command_args:
-                        new_command_args[arg] = command_args[arg]
-                command_args = new_command_args
         injection_variables = {
             "user": self.user,
             "agent_name": self.agent_name,
@@ -173,6 +152,7 @@ class Extensions:
             "conversation_name": self.conversation_name,
             "enabled_commands": self.get_enabled_commands(),
             "ApiClient": self.ApiClient,
+            "api_key": self.api_key,
             **self.agent_config["settings"],
         }
         command_function, module, params = self.find_command(command_name=command_name)

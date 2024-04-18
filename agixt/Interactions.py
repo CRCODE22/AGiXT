@@ -8,6 +8,7 @@ import tiktoken
 from datetime import datetime
 from readers.website import WebsiteReader
 from readers.file import FileReader
+from readers.youtube import YoutubeReader
 from Websearch import Websearch
 from Extensions import Extensions
 from ApiClient import (
@@ -42,11 +43,11 @@ class Interactions:
                 agent_name=self.agent_name,
                 agent_config=self.agent.AGENT_CONFIG,
                 ApiClient=ApiClient,
-                searxng_instance_url=self.agent.AGENT_CONFIG["settings"][
-                    "SEARXNG_INSTANCE_URL"
-                ]
-                if "SEARXNG_INSTANCE_URL" in self.agent.AGENT_CONFIG["settings"]
-                else "",
+                searxng_instance_url=(
+                    self.agent.AGENT_CONFIG["settings"]["SEARXNG_INSTANCE_URL"]
+                    if "SEARXNG_INSTANCE_URL" in self.agent.AGENT_CONFIG["settings"]
+                    else ""
+                ),
             )
         else:
             self.agent_name = ""
@@ -56,6 +57,13 @@ class Interactions:
             agent_name=self.agent_name,
             agent_config=self.agent.AGENT_CONFIG,
             collection_number=int(collection_number),
+            ApiClient=ApiClient,
+            user=user,
+        )
+        self.yt = YoutubeReader(
+            agent_name=self.agent_name,
+            agent_config=self.agent.AGENT_CONFIG,
+            collection_number=1,
             ApiClient=ApiClient,
             user=user,
         )
@@ -93,6 +101,7 @@ class Interactions:
         step_number=0,
         conversation_name="",
         websearch: bool = False,
+        vision_response: str = "",
         **kwargs,
     ):
         if "user_input" in kwargs and user_input == "":
@@ -189,6 +198,8 @@ class Interactions:
             context = f"The user's input causes you remember these things:\n{context}\n"
         else:
             context = ""
+        if vision_response != "":
+            context += f"Visual thoughts from viewing images:\n{vision_response}\n"
         if chain_name != "":
             try:
                 for arg, value in kwargs.items():
@@ -198,7 +209,10 @@ class Interactions:
                             chain_name=chain_name, step_number=step_number
                         )
                         # replace the {STEPx} with the response
-                        value = value.replace(f"{{STEP{step_number}}}", step_response)
+                        value = value.replace(
+                            f"{{STEP{step_number}}}",
+                            step_response if step_response else "",
+                        )
                         kwargs[arg] = value
             except:
                 logging.info("No args to replace.")
@@ -206,12 +220,16 @@ class Interactions:
                 step_response = self.chain.get_step_response(
                     chain_name=chain_name, step_number=step_number
                 )
-                prompt = prompt.replace(f"{{STEP{step_number}}}", step_response)
+                prompt = prompt.replace(
+                    f"{{STEP{step_number}}}", step_response if step_response else ""
+                )
             if "{STEP" in user_input:
                 step_response = self.chain.get_step_response(
                     chain_name=chain_name, step_number=step_number
                 )
-                user_input = user_input.replace(f"{{STEP{step_number}}}", step_response)
+                user_input = user_input.replace(
+                    f"{{STEP{step_number}}}", step_response if step_response else ""
+                )
         try:
             working_directory = self.agent.AGENT_CONFIG["settings"]["WORKING_DIRECTORY"]
         except:
@@ -338,6 +356,11 @@ class Interactions:
                 )
                 if fragmented_content != "":
                     file_contents = f"Here is some potentially relevant information from {the_files}\n{fragmented_content}\n\n"
+        command_list = [
+            available_command["friendly_name"]
+            for available_command in self.agent.available_commands
+            if available_command["enabled"] == True
+        ]
         skip_args = [
             "user_input",
             "agent_name",
@@ -359,9 +382,9 @@ class Interactions:
             string=prompt,
             user_input=user_input,
             agent_name=self.agent_name,
-            COMMANDS=self.agent_commands,
+            COMMANDS=self.agent_commands if len(command_list) > 0 else "",
             context=context,
-            command_list=self.agent_commands,
+            command_list=self.agent_commands if len(command_list) > 0 else "",
             date=datetime.now().strftime("%B %d, %Y %I:%M %p"),
             working_directory=working_directory,
             helper_agent_name=helper_agent_name,
@@ -389,30 +412,14 @@ class Interactions:
         browse_links: bool = False,
         prompt_category: str = "Default",
         persist_context_in_history: bool = False,
-        is_m4a_audio: bool = False,
-        is_wav_audio: bool = False,
+        images: list = [],
+        create_image: bool = False,
         **kwargs,
     ):
-        if is_m4a_audio or is_wav_audio:
-            # Convert the audio to text
-            ext = Extensions(
-                agent_name=self.agent_name,
-                agent_config=self.agent.AGENT_CONFIG,
-                conversation_name=conversation_name,
-                ApiClient=self.ApiClient,
-                user=self.user,
-            )
-            command_output = await ext.execute_command(
-                command_name="Transcribe M4A Audio"
-                if is_m4a_audio
-                else "Transcribe WAV Audio",
-                command_args={"base64_audio": user_input},
-            )
-            user_input = command_output
         shots = int(shots)
         if "prompt_category" in kwargs:
             prompt_category = kwargs["prompt_category"]
-        disable_memory = True if str(disable_memory).lower() == "true" else False
+        disable_memory = False if str(disable_memory).lower() == "false" else True
         browse_links = True if str(browse_links).lower() == "true" else False
         if "conversation_name" in kwargs:
             conversation_name = kwargs["conversation_name"]
@@ -434,10 +441,19 @@ class Interactions:
                     if link not in self.websearch.browsed_links:
                         logging.info(f"Browsing link: {link}")
                         self.websearch.browsed_links.append(link)
-                        (
-                            text_content,
-                            link_list,
-                        ) = await self.agent_memory.write_website_to_memory(url=link)
+                        if str(link).startswith("https://www.youtube.com/watch?v="):
+                            video_id = link.split("watch?v=")[1]
+                            await self.yt.write_youtube_captions_to_memory(
+                                video_id=video_id
+                            )
+                            link_list = None
+                        else:
+                            (
+                                text_content,
+                                link_list,
+                            ) = await self.agent_memory.write_website_to_memory(
+                                url=link
+                            )
                         if int(websearch_depth) > 0:
                             if link_list is not None and len(link_list) > 0:
                                 i = 0
@@ -466,6 +482,30 @@ class Interactions:
                     websearch_depth=websearch_depth,
                     websearch_timeout=websearch_timeout,
                 )
+        vision_response = ""
+        if "vision_provider" in self.agent.AGENT_CONFIG["settings"]:
+            vision_provider = self.agent.AGENT_CONFIG["settings"]["vision_provider"]
+            if images != [] and vision_provider != "None" and vision_provider != "":
+                try:
+                    vision_response = await self.agent.inference(
+                        prompt=user_input, tokens=tokens, images=images
+                    )
+                except:
+                    pass
+        image_response = ""
+        if create_image:
+            try:
+                sd_prompt = self.ApiClient.prompt_agent(
+                    agent_name=self.agent_name,
+                    prompt_name="AGiXT SD Generator_V3",
+                    prompt_args={
+                        "user_input": user_input,
+                        "conversation_name": "AGiXT Terminal",
+                    },
+                )
+                image_response = await self.agent.generate_image(prompt=sd_prompt)
+            except:
+                pass
         formatted_prompt, unformatted_prompt, tokens = await self.format_prompt(
             user_input=user_input,
             top_results=int(context_results),
@@ -475,6 +515,7 @@ class Interactions:
             step_number=step_number,
             conversation_name=conversation_name,
             websearch=websearch,
+            vision_response=vision_response,
             **kwargs,
         )
         log_message = (
@@ -490,7 +531,9 @@ class Interactions:
             user=self.user,
         )
         try:
-            self.response = await self.agent.inference(formatted_prompt, tokens=tokens)
+            self.response = await self.agent.inference(
+                prompt=formatted_prompt, tokens=tokens
+            )
         except Exception as e:
             # Log the error with the full traceback for the provider
             error = ""
@@ -570,6 +613,8 @@ class Interactions:
                     for shot, response in enumerate(responses)
                 ]
             )
+        if image_response != "":
+            self.response += f"\n![image]({image_response})"
         return self.response
 
     def create_command_suggestion_chain(self, agent_name, command_name, command_args):
@@ -598,8 +643,13 @@ class Interactions:
         return f"**The command has been added to a chain called '{agent_name} Command Suggestions' for you to review and execute manually.**"
 
     async def execution_agent(self, conversation_name):
-        commands_to_execute = re.findall(r"#execute_command\((.*?)\)", self.response)
-        if commands_to_execute:
+        command_list = [
+            available_command["friendly_name"]
+            for available_command in self.agent.available_commands
+            if available_command["enabled"] == True
+        ]
+        if len(command_list) > 0:
+            commands_to_execute = re.findall(r"#execute\((.*?)\)", self.response)
             reformatted_response = self.response
             if len(commands_to_execute) > 0:
                 for command in commands_to_execute:
@@ -614,52 +664,62 @@ class Interactions:
                                 )
                             except:
                                 command_args = {}
-                        for available_command in self.agent.available_commands:
-                            if command_name == available_command["friendly_name"]:
-                                # Check if the command is a valid command in the self.agent.available_commands list
-                                try:
-                                    if bool(self.agent.AUTONOMOUS_EXECUTION) == True:
-                                        ext = Extensions(
+                        if command_name not in command_list:
+                            # Ask the agent for clarification on which command should be executed.
+                            response = self.ApiClient.prompt_agent(
+                                agent_name=self.agent_name,
+                                prompt_name="Command Clarification",
+                                prompt_args={
+                                    "command_name": command_name,
+                                    "command_args": json.dumps(command_args),
+                                    "conversation_name": "AGiXT Terminal",
+                                },
+                            )
+                        else:
+                            # Check if the command is a valid command in the self.agent.available_commands list
+                            try:
+                                if bool(self.agent.AUTONOMOUS_EXECUTION) == True:
+                                    ext = Extensions(
+                                        agent_name=self.agent_name,
+                                        agent_config=self.agent.AGENT_CONFIG,
+                                        conversation_name=conversation_name,
+                                        ApiClient=self.ApiClient,
+                                        user=self.user,
+                                    )
+                                    command_output = await ext.execute_command(
+                                        command_name=command_name,
+                                        command_args=command_args,
+                                    )
+                                    formatted_output = (
+                                        f"```\n{command_output}\n```"
+                                        if "#GENERATED_IMAGE" not in command_output
+                                        and "#GENERATED_AUDIO" not in command_output
+                                        else command_output
+                                    )
+                                    message = f"**Executed Command:** `{command_name}` with the following parameters:\n```json\n{json.dumps(command_args, indent=4)}\n```\n\n**Command Output:**\n{formatted_output}"
+                                    log_interaction(
+                                        agent_name=self.agent_name,
+                                        conversation_name=f"{self.agent_name} Command Execution Log",
+                                        role=self.agent_name,
+                                        message=message,
+                                        user=self.user,
+                                    )
+                                else:
+                                    command_output = (
+                                        self.create_command_suggestion_chain(
                                             agent_name=self.agent_name,
-                                            agent_config=self.agent.AGENT_CONFIG,
-                                            conversation_name=conversation_name,
-                                            ApiClient=self.ApiClient,
-                                            user=self.user,
-                                        )
-                                        command_output = await ext.execute_command(
                                             command_name=command_name,
                                             command_args=command_args,
                                         )
-                                        formatted_output = (
-                                            f"```\n{command_output}\n```"
-                                            if "#GENERATED_IMAGE" not in command_output
-                                            and "#GENERATED_AUDIO" not in command_output
-                                            else command_output
-                                        )
-                                        message = f"**Executed Command:** `{command_name}` with the following parameters:\n```json\n{json.dumps(command_args, indent=4)}\n```\n\n**Command Output:**\n{formatted_output}"
-                                        log_interaction(
-                                            agent_name=self.agent_name,
-                                            conversation_name=f"{self.agent_name} Command Execution Log",
-                                            role=self.agent_name,
-                                            message=message,
-                                            user=self.user,
-                                        )
-                                    else:
-                                        command_output = (
-                                            self.create_command_suggestion_chain(
-                                                agent_name=self.agent_name,
-                                                command_name=command_name,
-                                                command_args=command_args,
-                                            )
-                                        )
-                                except Exception as e:
-                                    logging.error(
-                                        f"Error: {self.agent_name} failed to execute command `{command_name}`. {e}"
                                     )
-                                    command_output = f"**Failed to execute command `{command_name}` with args `{command_args}`. Please try again.**"
-                                reformatted_response = reformatted_response.replace(
-                                    f"#execute_command({command_name}, {command_args})",
-                                    command_output,
+                            except Exception as e:
+                                logging.error(
+                                    f"Error: {self.agent_name} failed to execute command `{command_name}`. {e}"
                                 )
-                if reformatted_response != self.response:
-                    self.response = reformatted_response
+                                command_output = f"**Failed to execute command `{command_name}` with args `{command_args}`. Please try again.**"
+                            reformatted_response = reformatted_response.replace(
+                                f"#execute({command_name}, {command_args})",
+                                command_output,
+                            )
+                            if reformatted_response != self.response:
+                                self.response = reformatted_response

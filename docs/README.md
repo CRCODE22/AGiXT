@@ -56,7 +56,7 @@ Please note that using some AI providers (such as OpenAI's GPT-4 API) can be exp
 - **Task Execution & Smart Task Management**: Efficient management and execution of complex tasks broken down into sub-tasks. The Smart Task feature employs AI-driven agents to dynamically handle tasks, optimizing efficiency and avoiding redundancy.
 - **Chain Management**: Sophisticated handling of chains or a series of linked commands, enabling the automation of complex workflows and processes.
 - **Web Browsing & Command Execution**: Advanced capabilities to browse the web and execute commands for a more interactive AI experience, opening a wide range of possibilities for AI assistance.
-- **Multi-Provider Compatibility**: Seamless integration with leading AI providers such as OpenAI GPT series, Hugging Face Huggingchat, GPT4All, GPT4Free, Oobabooga Text Generation Web UI, Kobold, llama.cpp, FastChat, Google Bard, Bing, and more.
+- **Multi-Provider Compatibility**: Seamless integration with leading AI providers such as OpenAI (as well as any that use OpenAI style endpoints), ezLocalai, Hugging Face, GPT4Free, Google Gemini, and more.
 - **Versatile Plugin System & Code Evaluation**: Extensible command support for various AI models along with robust support for code evaluation, providing assistance in programming tasks.
 - **Docker Deployment**: Simplified setup and maintenance through Docker deployment.
 - **Audio-to-Text & Text-to-Speech Options**: Integration with Hugging Face for seamless audio-to-text transcription, and multiple TTS choices, featuring Brian TTS, Mac OS TTS, and ElevenLabs.
@@ -64,6 +64,8 @@ Please note that using some AI providers (such as OpenAI's GPT-4 API) can be exp
 - **Custom Prompts & Command Control**: Granular control over agent abilities through enabling or disabling specific commands, and easy creation, editing, and deletion of custom prompts to standardize user inputs.
 - **RESTful API**: FastAPI-powered RESTful API for seamless integration with external applications and services.
 - **Expanding AI Support**: Continually updated to include new AI providers and services, ensuring the software stays at the forefront of AI technology.
+
+The features that AGiXT provides cover a wide range of services and are used for different tasks. Refer to [Processes and Frameworks](https://josh-xt.github.io/AGiXT/2-Concepts/1-Processes%20and%20Frameworks.html) for more details about the services and framework.
 
 ### Getting Started with Local Models and AGiXT Video
 
@@ -91,10 +93,20 @@ This is a video that walks through the process of setting up and using AGiXT to 
 
 Open a PowerShell terminal and run the following to download and install AGiXT:
 
+Windows and Mac:
+
 ```bash
 git clone https://github.com/Josh-XT/AGiXT
 cd AGiXT
 ./AGiXT.ps1
+```
+
+Linux:
+
+```bash
+git clone https://github.com/Josh-XT/AGiXT
+cd AGiXT
+sudo pwsh ./AGiXT.ps1
 ```
 
 When you run the `AGiXT.ps1` script for the first time, it will create a `.env` file automatically. There are a few questions asked on first run to help you get started. The default options are recommended for most users.
