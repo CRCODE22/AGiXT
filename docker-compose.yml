@@ -1,6 +1,6 @@
 services:
   agixt:
-    image: joshxt/agixt:latest
+    image: joshxt/agixt:sha-0a1a765
     init: true
     environment:
       DATABASE_TYPE: ${DATABASE_TYPE:-sqlite}
@@ -81,7 +81,7 @@ services:
       - ./WORKSPACE:/agixt/WORKSPACE
       - /var/run/docker.sock:/var/run/docker.sock
   agixtinteractive:
-    image: joshxt/agixt-interactive:main
+    image: joshxt/agixt-interactive:sha-5d75ed7
     init: true
     environment:
       MODE: production
