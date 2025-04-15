@@ -8,44 +8,50 @@ from PIL import Image
 
 
 class HuggingfaceProvider:
+    """
+    This provider uses the Huggingface API to generate text from prompts, images, and more. Get your Huggingface API key at <https://huggingface.co/login>.
+    """
+
     def __init__(
         self,
-        HUGGINGFACE_API_KEY: str = None,
-        STABLE_DIFFUSION_MODEL: str = "runwayml/stable-diffusion-v1-5",
-        STABLE_DIFFUSION_API_URL: str = "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5",
-        AI_MODEL: str = "HuggingFaceH4/zephyr-7b-beta",
-        stop=["<|end|>"],
-        MAX_TOKENS: int = 1024,
-        AI_TEMPERATURE: float = 0.7,
-        MAX_RETRIES: int = 15,
+        HUGGINGFACE_API_KEY: str = "",
+        HUGGINGFACE_STABLE_DIFFUSION_MODEL: str = "runwayml/stable-diffusion-v1-5",
+        HUGGINGFACE_STABLE_DIFFUSION_API_URL: str = "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5",
+        HUGGINGFACE_MODEL: str = "HuggingFaceH4/zephyr-7b-beta",
+        HUGGINGFACE_STOP_TOKEN=["<|end|>"],
+        HUGGINGFACE_MAX_TOKENS: int = 1024,
+        HUGGINGFACE_TEMPERATURE: float = 0.7,
+        HUGGINGFACE_MAX_RETRIES: int = 15,
         **kwargs,
     ):
+        self.friendly_name = "Huggingface"
         self.requirements = []
-        self.AI_MODEL = AI_MODEL
+        self.AI_MODEL = HUGGINGFACE_MODEL
         self.HUGGINGFACE_API_KEY = HUGGINGFACE_API_KEY
         self.HUGGINGFACE_API_URL = (
             f"https://api-inference.huggingface.co/models/{self.AI_MODEL}"
         )
         if (
-            STABLE_DIFFUSION_MODEL != "runwayml/stable-diffusion-v1-5"
-            and STABLE_DIFFUSION_API_URL.startswith(
+            HUGGINGFACE_STABLE_DIFFUSION_MODEL != "runwayml/stable-diffusion-v1-5"
+            and HUGGINGFACE_STABLE_DIFFUSION_MODEL.startswith(
                 "https://api-inference.huggingface.co/models"
             )
         ):
-            self.STABLE_DIFFUSION_API_URL = (
-                f"https://api-inference.huggingface.co/models/{STABLE_DIFFUSION_MODEL}"
-            )
+            self.STABLE_DIFFUSION_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_STABLE_DIFFUSION_MODEL}"
         else:
-            self.STABLE_DIFFUSION_API_URL = STABLE_DIFFUSION_API_URL
-        self.AI_TEMPERATURE = AI_TEMPERATURE
-        self.MAX_TOKENS = MAX_TOKENS
-        self.stop = stop
-        self.MAX_RETRIES = MAX_RETRIES
+            self.STABLE_DIFFUSION_API_URL = HUGGINGFACE_STABLE_DIFFUSION_API_URL
+        self.AI_TEMPERATURE = HUGGINGFACE_TEMPERATURE
+        self.MAX_TOKENS = HUGGINGFACE_MAX_TOKENS
+        self.stop = HUGGINGFACE_STOP_TOKEN
+        try:
+            self.MAX_RETRIES = int(HUGGINGFACE_MAX_RETRIES)
+        except:
+            self.MAX_RETRIES = 3
         self.parameters = kwargs
 
     @staticmethod
     def services():
-        return ["llm", "tts", "image"]
+        return ["llm", "image"]
 
     async def inference(self, prompt, tokens: int = 0, images: list = []):
         payload = {
@@ -64,7 +70,7 @@ class HuggingfaceProvider:
         tries = 0
         while True:
             tries += 1
-            if tries > self.MAX_RETRIES:
+            if int(tries) > int(self.MAX_RETRIES):
                 raise ValueError(f"Reached max retries: {self.MAX_RETRIES}")
             response = requests.post(
                 self.HUGGINGFACE_API_URL,
@@ -99,7 +105,6 @@ class HuggingfaceProvider:
     async def generate_image(
         self,
         prompt: str,
-        filename: str = "",
         negative_prompt: str = "out of frame,lowres,text,error,cropped,worst quality,low quality,jpeg artifacts,ugly,duplicate,morbid,mutilated,out of frame,extra fingers,mutated hands,poorly drawn hands,poorly drawn face,mutation,deformed,blurry,dehydrated,bad anatomy,bad proportions,extra limbs,cloned face,disfigured,gross proportions,malformed limbs,missing arms,missing legs,extra arms,extra legs,fused fingers,too many fingers,long neck,username,watermark,signature",
         batch_size: int = 1,
         cfg_scale: int = 7,
@@ -126,8 +131,7 @@ class HuggingfaceProvider:
         tiling: bool = False,
         width: int = 768,
     ) -> str:
-        if filename == "":
-            filename = f"{uuid.uuid4()}.png"
+        filename = f"{uuid.uuid4()}.png"
         image_path = f"./WORKSPACE/{filename}"
         headers = {}
         if (

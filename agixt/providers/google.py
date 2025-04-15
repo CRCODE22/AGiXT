@@ -1,6 +1,7 @@
 import asyncio
 import os
 from pathlib import Path
+from Globals import getenv
 
 try:
     import google.generativeai as genai  # Primary import attempt
@@ -22,23 +23,28 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "gTTS"])
     import gtts as ts
 
-from pydub import AudioSegment
+import uuid
 
 
 class GoogleProvider:
+    """
+    This provider uses the Google AI Studio API to generate text from prompts. Get your Google API key at <https://aistudio.google.com/>.
+    """
+
     def __init__(
         self,
-        GOOGLE_API_KEY: str = "None",
-        AI_MODEL: str = "gemini-pro",
-        MAX_TOKENS: int = 4000,
-        AI_TEMPERATURE: float = 0.7,
+        GOOGLE_API_KEY: str = "",
+        GOOGLE_MODEL: str = "gemini-2.0-flash-exp",
+        GOOGLE_MAX_TOKENS: int = 1000000,
+        GOOGLE_TEMPERATURE: float = 0.7,
         **kwargs,
     ):
+        self.friendly_name = "Google AI Studio"
         self.requirements = ["google-generativeai", "gTTS", "pydub"]
         self.GOOGLE_API_KEY = GOOGLE_API_KEY
-        self.AI_MODEL = AI_MODEL
-        self.MAX_TOKENS = MAX_TOKENS
-        self.AI_TEMPERATURE = AI_TEMPERATURE
+        self.AI_MODEL = GOOGLE_MODEL
+        self.MAX_TOKENS = GOOGLE_MAX_TOKENS
+        self.AI_TEMPERATURE = GOOGLE_TEMPERATURE
 
     @staticmethod
     def services():
@@ -50,13 +56,12 @@ class GoogleProvider:
         try:
             genai.configure(api_key=self.GOOGLE_API_KEY)
             generation_config = genai.types.GenerationConfig(
-                max_output_tokens=new_max_tokens, temperature=float(self.AI_TEMPERATURE)
+                temperature=float(self.AI_TEMPERATURE)
             )
             model = genai.GenerativeModel(
-                model_name=self.AI_MODEL if not images else "gemini-pro-vision",
+                model_name=self.AI_MODEL,
                 generation_config=generation_config,
             )
-            new_max_tokens = int(self.MAX_TOKENS) - tokens
             new_prompt = []
             if images:
                 for image in images:
@@ -82,18 +87,12 @@ class GoogleProvider:
                 )
             return generated_text
         except Exception as e:
-            return f"Gemini Error: {e}"
+            raise Exception(f"Gemini Error: {e}")
 
     async def text_to_speech(self, text: str):
         tts = ts.gTTS(text)
-        mp3_path = "speech.mp3"
+        filename = f"{uuid.uuid4()}.mp3"
+        mp3_path = os.path.join(os.getcwd(), "WORKSPACE", filename)
         tts.save(mp3_path)
-        wav_path = "output_speech.wav"
-        AudioSegment.from_mp3(mp3_path).set_frame_rate(16000).export(
-            wav_path, format="wav"
-        )
-        os.remove(mp3_path)
-        with open(wav_path, "rb") as f:
-            audio_content = f.read()
-        os.remove(wav_path)
-        return audio_content
+        agixt_uri = getenv("AGIXT_URI")
+        return f"{agixt_uri}/outputs/{filename}"

@@ -5,11 +5,13 @@ import glob
 import os
 import inspect
 import logging
-from dotenv import load_dotenv
+from Globals import getenv
 
-load_dotenv()
-
-DISABLED_PROVIDERS = os.getenv("DISABLED_PROVIDERS", "").replace(" ", "").split(",")
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
+DISABLED_PROVIDERS = getenv("DISABLED_PROVIDERS").replace(" ", "").split(",")
 
 
 def get_providers():
@@ -52,6 +54,49 @@ def get_providers_with_settings():
         providers.append(
             {
                 provider: get_provider_options(provider_name=provider),
+            }
+        )
+    return providers
+
+
+def get_providers_with_details():
+    providers = {}
+    for provider in get_providers():
+        if provider == "rotation":
+            continue
+        if provider == "gpt4free":
+            continue
+        if provider == "default":
+            continue
+        module = importlib.import_module(f"providers.{provider}")
+        provider_class = getattr(module, f"{provider.capitalize()}Provider")
+        provider_settings = get_provider_options(provider_name=provider)
+        if "provider" in provider_settings:
+            del provider_settings["provider"]
+        documentation = provider_class.__doc__ if provider_class.__doc__ else ""
+        # Remove first and last lines if they're \n or whitespce
+        documentation = documentation.strip()
+        if documentation.startswith("\n"):
+            documentation = documentation[1:]
+        if documentation.endswith("\n"):
+            documentation = documentation[:-1]
+        documentation = documentation.strip()
+        providers.update(
+            {
+                provider: {
+                    "name": (
+                        provider_class.friendly_name
+                        if hasattr(provider_class, "friendly_name")
+                        else provider.capitalize()
+                    ),
+                    "description": documentation,
+                    "services": (
+                        provider_class.services()
+                        if hasattr(provider_class, "services")
+                        else []
+                    ),
+                    "settings": provider_settings,
+                }
             }
         )
     return providers
@@ -100,10 +145,11 @@ class Providers:
             self.instance = provider_class(**kwargs)
 
             # Install the requirements if any
-            self.install_requirements()
+            # self.install_requirements()
 
         except (ModuleNotFoundError, AttributeError) as e:
-            raise AttributeError(f"module {__name__} has no attribute {name}") from e
+            if name != None and name != "None" and not str(name).startswith("__"):
+                logging.info(f"Error loading provider: {name}")
 
     def __getattr__(self, attr):
         return getattr(self.instance, attr)

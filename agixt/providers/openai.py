@@ -1,9 +1,10 @@
 import time
 import logging
 import random
-import base64
+import requests
+import uuid
+from Globals import getenv
 import numpy as np
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 
 try:
     import openai
@@ -16,46 +17,45 @@ except ImportError:
 
 
 class OpenaiProvider:
+    """
+    This provider uses the OpenAI API to generate text from prompts. Get your OpenAI API key at <https://platform.openai.com/account/api-keys>.
+    """
+
+    friendly_name = "OpenAI"
+
     def __init__(
         self,
         OPENAI_API_KEY: str = "",
-        AI_MODEL: str = "gpt-3.5-turbo-16k-0613",
-        API_URI: str = "https://api.openai.com/v1",
-        MAX_TOKENS: int = 16000,
-        AI_TEMPERATURE: float = 0.7,
-        AI_TOP_P: float = 0.7,
-        WAIT_BETWEEN_REQUESTS: int = 1,
-        WAIT_AFTER_FAILURE: int = 3,
-        SYSTEM_MESSAGE: str = "",
-        VOICE: str = "alloy",
-        TRANSCRIPTION_MODEL: str = "whisper-1",
+        OPENAI_MODEL: str = "gpt-4o",
+        OPENAI_API_URI: str = "https://api.openai.com/v1",
+        OPENAI_MAX_TOKENS: int = 128000,
+        OPENAI_TEMPERATURE: float = 0.7,
+        OPENAI_TOP_P: float = 0.7,
+        OPENAI_WAIT_BETWEEN_REQUESTS: int = 1,
+        OPENAI_WAIT_AFTER_FAILURE: int = 3,
+        OPENAI_VOICE: str = "alloy",
+        OPENAI_TRANSCRIPTION_MODEL: str = "whisper-1",
         **kwargs,
     ):
         self.requirements = ["openai"]
-        self.AI_MODEL = AI_MODEL if AI_MODEL else "gpt-3.5-turbo-16k-0613"
-        self.AI_TEMPERATURE = AI_TEMPERATURE if AI_TEMPERATURE else 0.7
-        self.AI_TOP_P = AI_TOP_P if AI_TOP_P else 0.7
-        self.MAX_TOKENS = MAX_TOKENS if MAX_TOKENS else 16000
-        self.API_URI = API_URI if API_URI else "https://api.openai.com/v1"
-        self.WAIT_AFTER_FAILURE = WAIT_AFTER_FAILURE if WAIT_AFTER_FAILURE else 3
+        self.AI_MODEL = OPENAI_MODEL if OPENAI_MODEL else "gpt-4o"
+        self.AI_TEMPERATURE = OPENAI_TEMPERATURE if OPENAI_TEMPERATURE else 0.7
+        self.AI_TOP_P = OPENAI_TOP_P if OPENAI_TOP_P else 0.7
+        self.MAX_TOKENS = OPENAI_MAX_TOKENS if OPENAI_MAX_TOKENS else 128000
+        self.API_URI = OPENAI_API_URI if OPENAI_API_URI else "https://api.openai.com/v1"
+        self.WAIT_AFTER_FAILURE = (
+            OPENAI_WAIT_AFTER_FAILURE if OPENAI_WAIT_AFTER_FAILURE else 3
+        )
         self.WAIT_BETWEEN_REQUESTS = (
-            WAIT_BETWEEN_REQUESTS if WAIT_BETWEEN_REQUESTS else 1
+            OPENAI_WAIT_BETWEEN_REQUESTS if OPENAI_WAIT_BETWEEN_REQUESTS else 1
         )
         self.OPENAI_API_KEY = OPENAI_API_KEY
-        self.SYSTEM_MESSAGE = SYSTEM_MESSAGE
-        self.VOICE = VOICE if VOICE else "alloy"
+        self.VOICE = OPENAI_VOICE if OPENAI_VOICE else "alloy"
         self.TRANSCRIPTION_MODEL = (
-            TRANSCRIPTION_MODEL if TRANSCRIPTION_MODEL else "whisper-1"
+            OPENAI_TRANSCRIPTION_MODEL if OPENAI_TRANSCRIPTION_MODEL else "whisper-1"
         )
         self.FAILURES = []
-        try:
-            self.embedder = OpenAIEmbeddingFunction(
-                model_name="text-embedding-3-small",
-                api_key=self.OPENAI_API_KEY,
-                api_base=self.API_URI,
-            )
-        except Exception as e:
-            self.embedder = None
+        self.failures = 0
         self.chunk_size = 1024
 
     @staticmethod
@@ -64,7 +64,6 @@ class OpenaiProvider:
             "llm",
             "tts",
             "image",
-            "embeddings",
             "transcription",
             "translation",
             "vision",
@@ -82,12 +81,13 @@ class OpenaiProvider:
 
     async def inference(self, prompt, tokens: int = 0, images: list = []):
         if images != []:
-            if "vision" not in self.AI_MODEL:
-                self.AI_MODEL = "gpt-4-vision-preview"
+            if "vision" not in self.AI_MODEL and self.AI_MODEL != "gpt-4o":
+                self.AI_MODEL = "gpt-4o"
         if not self.API_URI.endswith("/"):
             self.API_URI += "/"
         openai.base_url = self.API_URI if self.API_URI else "https://api.openai.com/v1/"
         openai.api_key = self.OPENAI_API_KEY
+        openai.api_type = "openai"
         if self.OPENAI_API_KEY == "" or self.OPENAI_API_KEY == "YOUR_OPENAI_API_KEY":
             if self.API_URI == "https://api.openai.com/v1/":
                 return (
@@ -122,8 +122,6 @@ class OpenaiProvider:
                     )
         else:
             messages.append({"role": "user", "content": prompt})
-        if self.SYSTEM_MESSAGE:
-            messages.append({"role": "system", "content": self.SYSTEM_MESSAGE})
 
         if int(self.WAIT_BETWEEN_REQUESTS) > 0:
             time.sleep(int(self.WAIT_BETWEEN_REQUESTS))
@@ -140,6 +138,9 @@ class OpenaiProvider:
             return response.choices[0].message.content
         except Exception as e:
             logging.info(f"OpenAI API Error: {e}")
+            self.failures += 1
+            if self.failures > 3:
+                raise Exception(f"OpenAI API Error: Too many failures. {e}")
             if "," in self.API_URI:
                 self.rotate_uri()
             if int(self.WAIT_AFTER_FAILURE) > 0:
@@ -150,6 +151,7 @@ class OpenaiProvider:
     async def transcribe_audio(self, audio_path: str):
         openai.base_url = self.API_URI if self.API_URI else "https://api.openai.com/v1/"
         openai.api_key = self.OPENAI_API_KEY
+        openai.api_type = "openai"
         with open(audio_path, "rb") as audio_file:
             transcription = openai.audio.transcriptions.create(
                 model=self.TRANSCRIPTION_MODEL, file=audio_file
@@ -159,6 +161,7 @@ class OpenaiProvider:
     async def translate_audio(self, audio_path: str):
         openai.base_url = self.API_URI if self.API_URI else "https://api.openai.com/v1/"
         openai.api_key = self.OPENAI_API_KEY
+        openai.api_type = "openai"
         with open(audio_path, "rb") as audio_file:
             translation = openai.audio.translations.create(
                 model=self.TRANSCRIPTION_MODEL, file=audio_file
@@ -168,6 +171,7 @@ class OpenaiProvider:
     async def text_to_speech(self, text: str):
         openai.base_url = self.API_URI if self.API_URI else "https://api.openai.com/v1/"
         openai.api_key = self.OPENAI_API_KEY
+        openai.api_type = "openai"
         tts_response = openai.audio.speech.create(
             model="tts-1",
             voice=self.VOICE,
@@ -175,25 +179,30 @@ class OpenaiProvider:
         )
         return tts_response.content
 
-    async def generate_image(self, prompt: str, filename: str = "image.png") -> str:
+    async def generate_image(self, prompt: str) -> str:
+        filename = f"{uuid.uuid4()}.png"
         image_path = f"./WORKSPACE/{filename}"
+        openai.base_url = self.API_URI if self.API_URI else "https://api.openai.com/v1/"
         openai.api_key = self.OPENAI_API_KEY
-        response = openai.Image.create(
+        openai.api_type = "openai"
+        response = openai.images.generate(
             prompt=prompt,
+            model="dall-e-3",
             n=1,
-            size="256x256",
-            response_format="b64_json",
+            size="1024x1024",
+            response_format="url",
         )
         logging.info(f"Image Generated for prompt:{prompt}")
-        image_data = base64.b64decode(response["data"][0]["b64_json"])
-        with open(image_path, mode="wb") as png:
-            png.write(image_data)
-        encoded_image_data = base64.b64encode(image_data).decode("utf-8")
-        return f"data:image/png;base64,{encoded_image_data}"
+        url = response.data[0].url
+        with open(image_path, "wb") as f:
+            f.write(requests.get(url).content)
+        agixt_uri = getenv("AGIXT_URI")
+        return f"{agixt_uri}/outputs/{filename}"
 
     def embeddings(self, input) -> np.ndarray:
         openai.base_url = self.API_URI
         openai.api_key = self.OPENAI_API_KEY
+        openai.api_type = "openai"
         response = openai.embeddings.create(
             input=input,
             model="text-embedding-3-small",

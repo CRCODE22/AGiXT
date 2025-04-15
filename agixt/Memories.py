@@ -2,20 +2,33 @@ import logging
 import os
 import asyncio
 import sys
-import json
+from DB import (
+    Memory,
+    Agent,
+    User,
+    get_session,
+    get_similar_memories,
+    process_embedding_for_storage,
+)
 import spacy
-import chromadb
-from chromadb.config import Settings
-from chromadb.api.types import QueryResult
 from numpy import array, linalg, ndarray
-from hashlib import sha256
-from Providers import Providers
-from datetime import datetime
 from collections import Counter
 from typing import List
-from Defaults import DEFAULT_USER
+from Globals import getenv, DEFAULT_USER
+from textacy.extract.keyterms import textrank  # type: ignore
+from youtube_transcript_api import YouTubeTranscriptApi
+from onnxruntime import InferenceSession
+from tokenizers import Tokenizer
+from typing import List, cast, Union, Sequence
+from numpy import array, linalg, ndarray
+import numpy as np
+from datetime import datetime
+from uuid import UUID
 
-
+logging.basicConfig(
+    level=getenv("LOG_LEVEL"),
+    format=getenv("LOG_FORMAT"),
+)
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -28,6 +41,48 @@ def nlp(text):
         sp = spacy.load("en_core_web_sm")
     sp.max_length = 99999999999999999999999
     return sp(text)
+
+
+def embed(input: List[str]) -> List[Union[Sequence[float], Sequence[int]]]:
+    tokenizer = Tokenizer.from_file(os.path.join(os.getcwd(), "onnx", "tokenizer.json"))
+    tokenizer.enable_truncation(max_length=256)
+    tokenizer.enable_padding(pad_id=0, pad_token="[PAD]", length=256)
+    model = InferenceSession(os.path.join(os.getcwd(), "onnx", "model.onnx"))
+    all_embeddings = []
+    for i in range(0, len(input), 32):
+        batch = input[i : i + 32]
+        encoded = [tokenizer.encode(d) for d in batch]
+        input_ids = np.array([e.ids for e in encoded])
+        attention_mask = np.array([e.attention_mask for e in encoded])
+        onnx_input = {
+            "input_ids": np.array(input_ids, dtype=np.int64),
+            "attention_mask": np.array(attention_mask, dtype=np.int64),
+            "token_type_ids": np.array(
+                [np.zeros(len(e), dtype=np.int64) for e in input_ids],
+                dtype=np.int64,
+            ),
+        }
+        model_output = model.run(None, onnx_input)
+        last_hidden_state = model_output[0]
+        input_mask_expanded = np.broadcast_to(
+            np.expand_dims(attention_mask, -1), last_hidden_state.shape
+        )
+        embeddings = np.sum(last_hidden_state * input_mask_expanded, 1) / np.clip(
+            input_mask_expanded.sum(1), a_min=1e-9, a_max=None
+        )
+        norm = np.linalg.norm(embeddings, axis=1)
+        norm[norm == 0] = 1e-12
+        embeddings = (embeddings / norm[:, np.newaxis]).astype(np.float32)
+        all_embeddings.append(embeddings)
+    return cast(
+        List[Union[Sequence[float], Sequence[int]]], np.concatenate(all_embeddings)
+    ).tolist()
+
+
+def extract_keywords(doc=None, text="", limit=10):
+    if not doc:
+        doc = nlp(text)
+    return [k for k, s in textrank(doc, topn=limit)]
 
 
 def snake(old_str: str = ""):
@@ -68,78 +123,312 @@ def compute_similarity_scores(embedding: ndarray, embedding_array: ndarray) -> n
     return similarity_scores
 
 
-def query_results_to_records(results: "QueryResult"):
+def query_results_to_records(results):
     try:
         if isinstance(results["ids"][0], str):
             for k, v in results.items():
                 results[k] = [v]
     except IndexError:
         return []
-    memory_records = [
-        {
-            "is_reference": metadata["is_reference"] == "True",
-            "external_source_name": metadata["external_source_name"],
-            "id": metadata["id"],
-            "description": metadata["description"],
-            "text": document,
-            "embedding": embedding,
-            "additional_metadata": metadata["additional_metadata"],
-            "key": id,
-            "timestamp": metadata["timestamp"],
-        }
-        for id, document, embedding, metadata in zip(
-            results["ids"][0],
-            results["documents"][0],
-            results["embeddings"][0],
-            results["metadatas"][0],
-        )
-    ]
+    memory_records = []
+    for id, document, embedding, metadata in zip(
+        results["ids"][0],
+        results["documents"][0],
+        results["embeddings"][0],
+        results["metadatas"][0],
+    ):
+        if metadata:
+            memory_records.append(
+                {
+                    "external_source_name": metadata.get(
+                        "external_source_name", "user input"
+                    ),
+                    "id": metadata["id"],
+                    "description": metadata["description"],
+                    "text": document,
+                    "embedding": embedding,
+                    "additional_metadata": metadata["additional_metadata"],
+                    "key": id,
+                    "timestamp": metadata["timestamp"],
+                }
+            )
     return memory_records
 
 
-def get_chroma_client():
+def hash_user_id(user: str, length: int = 8) -> str:
     """
-    To use an external Chroma server, set the following environment variables:
-        CHROMA_HOST: The host of the Chroma server
-        CHROMA_PORT: The port of the Chroma server
-        CHROMA_API_KEY: The API key of the Chroma server
-        CHROMA_SSL: Set to "true" if the Chroma server uses SSL
+    Creates a consistent, short hash of a user identifier (usually email).
+
+    Args:
+        user: User identifier (email)
+        length: Desired length of the hash
+
+    Returns:
+        str: Short, consistent hash of the user ID
     """
-    chroma_host = os.environ.get("CHROMA_HOST", None)
-    chroma_settings = Settings(
-        anonymized_telemetry=False,
-    )
-    if chroma_host:
-        # Use external Chroma server
+    from hashlib import sha256
+    import base64
+
+    # Generate hash of the user identifier
+    hash_obj = sha256(user.encode())
+    hash_bytes = hash_obj.digest()[:6]  # Take first 6 bytes
+    # Use base32 for alphanumeric, url-safe output
+    hash_str = base64.b32encode(hash_bytes).decode().lower()
+
+    # Return consistent length hash
+    return hash_str[:length]
+
+
+def normalize_collection_name(
+    user: str, agent_name: str, collection_id: str = "0", max_length: int = 63
+) -> str:
+    """
+    Normalizes a collection name with hashed user ID for consistent length.
+    Format: uhash_agentname_collectionid
+
+    Args:
+        user: User identifier (email)
+        agent_name: Name of the agent
+        collection_id: Collection identifier/number
+        max_length: Maximum length for collection name
+
+    Returns:
+        str: Normalized collection name meeting Chroma's requirements
+    """
+    # Hash the user ID first
+    user_hash = hash_user_id(user)
+
+    # Snake case the agent name
+    agent_snake = snake(agent_name)
+
+    # Handle conversation IDs (long collection_id)
+    if len(collection_id) > 4:
+        # For conversation IDs, we'll hash the ID too
+        conv_hash = hash_user_id(collection_id, length=10)
+        normalized = f"u{user_hash}_{agent_snake}_{conv_hash}"
+    else:
+        # For normal collections, keep the number
+        normalized = f"u{user_hash}_{agent_snake}_{collection_id}"
+
+    # Ensure we're within length limits
+    if len(normalized) > max_length:
+        # If still too long, truncate agent name but keep user hash and collection id
+        available_space = (
+            max_length - len(user_hash) - len(collection_id) - 3
+        )  # 3 for u_ _
+        agent_snake = agent_snake[:available_space]
+        normalized = f"u{user_hash}_{agent_snake}_{collection_id}"
+
+    # Ensure it ends with alphanumeric
+    while not normalized[-1].isalnum():
+        normalized = normalized[:-1]
+
+    # Ensure minimum length of 3
+    while len(normalized) < 3:
+        normalized += "0"
+
+    return normalized
+
+
+def get_user_collections_prefix(user: str) -> str:
+    """
+    Gets the prefix for finding all collections belonging to a user.
+    """
+    user_hash = hash_user_id(user)
+    return f"u{user_hash}_"
+
+
+def get_base_collection_name(user: str, agent_name: str) -> str:
+    """
+    Gets the base collection name before normalization.
+    This is used to maintain consistent prefix for get_collections().
+    """
+    return snake(f"{user}_{agent_name}")
+
+
+def get_agent_id(agent_name: str, email: str) -> str:
+    """
+    Gets the agent ID for the given agent name and user.
+    """
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(email=email).first()
+        agent = session.query(Agent).filter_by(name=agent_name, user_id=user.id).first()
+        if agent:
+            return str(agent.id)
+        else:
+            agent = session.query(Agent).filter_by(user_id=user.id).first()
+            if agent:
+                return str(agent.id)
+            else:
+                return None
+    finally:
+        session.close()
+
+
+class SQLCollection:
+    def __init__(self, session, memories_instance):
+        self.session = session
+        self.memories = memories_instance
+
+    def query(self, query_embeddings, n_results=None, include=None):
+        """Emulate ChromaDB's query method using unified vector search"""
         try:
-            chroma_api_key = os.environ.get("CHROMA_API_KEY", None)
-            chroma_headers = (
-                {"Authorization": f"Bearer {chroma_api_key}"} if chroma_api_key else {}
-            )
-            return chromadb.HttpClient(
-                host=chroma_host,
-                port=os.environ.get("CHROMA_PORT", "8000"),
-                ssl=(
-                    False
-                    if os.environ.get("CHROMA_SSL", "false").lower() != "true"
-                    else True
+            if isinstance(query_embeddings, np.ndarray):
+                query_embeddings = query_embeddings.tolist()
+
+            memory_results = get_similar_memories(
+                self.session,
+                query_embeddings[0],  # Assuming single query
+                self.memories.agent_id,
+                (
+                    None
+                    if self.memories.collection_number == "0"
+                    else self.memories.collection_number
                 ),
-                headers=chroma_headers,
-                settings=chroma_settings,
+                n_results or 10,
+                0.0,  # No minimum score for ChromaDB-style queries
             )
-        except:
-            # If the external Chroma server is not available, use local memories folder
-            logging.warning(
-                f"Chroma server at {chroma_host} is not available. Using local memories folder."
+
+            if not memory_results:
+                return {
+                    "ids": [[]],
+                    "documents": [[]],
+                    "embeddings": [[]],
+                    "metadatas": [[]],
+                }
+
+            # Format results to match ChromaDB's expected structure
+            formatted_results = {
+                "ids": [[str(mem.id) for mem, _ in memory_results]],
+                "documents": [[mem.text for mem, _ in memory_results]],
+                "embeddings": [[mem.embedding for mem, _ in memory_results]],
+                "metadatas": [
+                    [
+                        {
+                            "external_source_name": mem.external_source,
+                            "id": str(mem.id),
+                            "description": mem.description,
+                            "additional_metadata": mem.additional_metadata,
+                            "timestamp": format_timestamp_iso(mem.timestamp),
+                            "distance": 1 - sim,  # Convert similarity to distance
+                        }
+                        for mem, sim in memory_results
+                    ]
+                ],
+            }
+
+            return formatted_results
+
+        except Exception as e:
+            logging.error(f"Error in query: {e}")
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "embeddings": [[]],
+                "metadatas": [[]],
+            }
+
+    def get(self):
+        # Existing get method remains the same...
+        memories = (
+            self.session.query(Memory)
+            .filter_by(
+                agent_id=self.memories.agent_id,
+                conversation_id=(
+                    None
+                    if self.memories.collection_number == "0"
+                    else self.memories.collection_number
+                ),
             )
-    # Persist to local memories folder
-    memories_dir = os.path.join(os.getcwd(), "memories")
-    if not os.path.exists(memories_dir):
-        os.makedirs(memories_dir)
-    return chromadb.PersistentClient(
-        path=memories_dir,
-        settings=chroma_settings,
-    )
+            .all()
+        )
+
+        if not memories:
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "embeddings": [[]],
+                "metadatas": [[]],
+            }
+
+        return {
+            "ids": [[m.id for m in memories]],
+            "documents": [[m.text for m in memories]],
+            "embeddings": [[m.embedding for m in memories]],
+            "metadatas": [
+                [
+                    {
+                        "external_source_name": m.external_source,
+                        "id": m.id,
+                        "description": m.description,
+                        "additional_metadata": m.additional_metadata,
+                        "timestamp": m.timestamp.isoformat(),
+                    }
+                    for m in memories
+                ]
+            ],
+        }
+
+    def delete(self, ids):
+        if isinstance(ids, str):
+            ids = [ids]
+        try:
+            self.session.query(Memory).filter(Memory.id.in_(ids)).delete(
+                synchronize_session="fetch"
+            )
+            self.session.commit()
+            return True
+        except Exception as e:
+            self.session.rollback()
+            logging.error(f"Error deleting memories: {e}")
+            return False
+
+    def add(self, ids, metadatas, documents):
+        try:
+            for id, metadata, document in zip(ids, metadatas, documents):
+                embedding = embed([document])
+                memory = Memory(
+                    id=id,
+                    agent_id=self.memories.agent_id,
+                    conversation_id=(
+                        None
+                        if self.memories.collection_number == "0"
+                        else self.memories.collection_number
+                    ),
+                    embedding=embedding,
+                    text=document,
+                    external_source=metadata.get("external_source_name", "user input"),
+                    description=metadata.get("description", ""),
+                    additional_metadata=metadata.get("additional_metadata", ""),
+                )
+                self.session.add(memory)
+            self.session.commit()
+            return True
+        except Exception as e:
+            self.session.rollback()
+            logging.error(f"Error adding memories: {e}")
+            return False
+
+
+def format_timestamp_iso(timestamp):
+    """Helper function to handle different timestamp formats and return ISO format"""
+    if isinstance(timestamp, datetime):
+        return timestamp.isoformat()
+    elif isinstance(timestamp, str):
+        return timestamp
+    else:
+        return datetime.now().isoformat()
+
+
+def format_timestamp(timestamp):
+    """Helper function to handle different timestamp formats"""
+    if isinstance(timestamp, datetime):
+        return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    elif isinstance(timestamp, str):
+        return timestamp
+    else:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 class Memories:
@@ -147,7 +436,7 @@ class Memories:
         self,
         agent_name: str = "AGiXT",
         agent_config=None,
-        collection_number: int = 0,
+        collection_number: str = "0",  # Is now actually a collection ID and a string to allow conversational memories.
         ApiClient=None,
         summarize_content: bool = False,
         user=DEFAULT_USER,
@@ -155,16 +444,22 @@ class Memories:
         global DEFAULT_USER
         self.agent_name = agent_name
         if not DEFAULT_USER:
-            DEFAULT_USER = "USER"
+            DEFAULT_USER = "user"
         if not user:
-            user = "USER"
-        if user != DEFAULT_USER:
-            self.collection_name = f"{snake(user)}_{snake(agent_name)}"
-        else:
-            self.collection_name = snake(f"{snake(DEFAULT_USER)}_{agent_name}")
-        self.collection_number = collection_number
-        if collection_number > 0:
-            self.collection_name = f"{self.collection_name}_{collection_number}"
+            user = "user"
+        self.user = user
+        self.agent_id = get_agent_id(agent_name=agent_name, email=self.user)
+        self.collection_name = get_base_collection_name(user, agent_name)
+        try:
+            self.collection_number = str(UUID(collection_number))
+        except:
+            self.collection_number = "0"
+        # Check if collection_number is a number, it might be a string
+        self.collection_name = normalize_collection_name(
+            user=self.user,
+            agent_name=self.agent_name,
+            collection_id=self.collection_number,
+        )
         if agent_config is None:
             agent_config = ApiClient.get_agentconfig(agent_name=agent_name)
         self.agent_config = (
@@ -177,74 +472,92 @@ class Memories:
             if "settings" in self.agent_config
             else {"embeddings_provider": "default"}
         )
-        self.chroma_client = get_chroma_client()
         self.ApiClient = ApiClient
-        self.embedding_provider = Providers(
-            name=(
-                self.agent_settings["embeddings_provider"]
-                if "embeddings_provider" in self.agent_settings
-                else "default"
-            ),
-            ApiClient=ApiClient,
-        )
-        self.chunk_size = (
-            self.embedding_provider.chunk_size
-            if hasattr(self.embedding_provider, "chunk_size")
-            else 256
-        )
-        self.embedder = self.embedding_provider.embedder
+        self.chunk_size = 256
         self.summarize_content = summarize_content
+        self.failures = 0
 
-    async def wipe_memory(self):
+    async def wipe_memory(self, conversation_id: str = None):
+        session = get_session()
         try:
-            self.chroma_client.delete_collection(name=self.collection_name)
+            query = session.query(Memory).filter_by(agent_id=self.agent_id)
+            if conversation_id:
+                query = query.filter_by(conversation_id=conversation_id)
+            query.delete()
+            session.commit()
             return True
-        except:
+        except Exception as e:
+            session.rollback()
+            logging.error(f"Error wiping memory: {e}")
             return False
+        finally:
+            session.close()
 
     async def export_collection_to_json(self):
-        collection = await self.get_collection()
-        if collection == None:
-            return ""
-        results = collection.get()
-        json_data = []
-        for id, document, embedding, metadata in zip(
-            results["ids"][0],
-            results["documents"][0],
-            results["embeddings"][0],
-            results["metadatas"][0],
-        ):
-            json_data.append(
-                {
-                    "external_source_name": metadata["external_source_name"],
-                    "description": metadata["description"],  # User input
-                    "text": document,
-                    "timestamp": metadata["timestamp"],
-                }
+        session = get_session()
+        try:
+            memories = (
+                session.query(Memory)
+                .filter_by(
+                    agent_id=self.agent_id,
+                    conversation_id=(
+                        self.collection_number
+                        if self.collection_number != "0"
+                        else None
+                    ),
+                )
+                .all()
             )
-        return json_data
+
+            json_data = []
+            for memory in memories:
+                json_data.append(
+                    {
+                        "external_source_name": memory.external_source,
+                        "description": memory.description,
+                        "text": memory.text,
+                        "timestamp": memory.timestamp.isoformat(),
+                    }
+                )
+            return json_data
+        finally:
+            session.close()
 
     async def export_collections_to_json(self):
-        collections = await self.get_collections()
-        json_export = []
-        for collection in collections:
-            self.collection_name = collection
-            json_data = await self.export_collection_to_json()
-            collection_number = collection.split("_")[-1]
-            json_export.append({f"{collection_number}": json_data})
-        return json_export
+        session = get_session()
+        try:
+            memories = session.query(Memory).filter_by(agent_id=self.agent_id).all()
+
+            # Group by conversation_id
+            memory_by_conversation = {}
+            for memory in memories:
+                conv_id = memory.conversation_id or "0"
+                if conv_id not in memory_by_conversation:
+                    memory_by_conversation[conv_id] = []
+                memory_by_conversation[conv_id].append(
+                    {
+                        "external_source_name": memory.external_source,
+                        "description": memory.description,
+                        "text": memory.text,
+                        "timestamp": memory.timestamp.isoformat(),
+                    }
+                )
+
+            return [
+                {conversation_id: memories}
+                for conversation_id, memories in memory_by_conversation.items()
+            ]
+        finally:
+            session.close()
 
     async def import_collections_from_json(self, json_data: List[dict]):
         for data in json_data:
             for key, value in data.items():
-                try:
-                    collection_number = int(key)
-                except:
-                    collection_number = 0
-                self.collection_number = collection_number
-                self.collection_name = snake(self.agent_name)
-                if collection_number > 0:
-                    self.collection_name = f"{self.collection_name}_{collection_number}"
+                self.collection_number = key if key else "0"
+                self.collection_name = snake(f"{self.user}_{self.agent_name}")
+                self.collection_name = (
+                    f"{self.collection_name}_{self.collection_number}"
+                )
                 for val in value[self.collection_name]:
                     try:
                         await self.write_text_to_memory(
@@ -256,32 +569,48 @@ class Memories:
                         pass
 
     # get collections that start with the collection name
-    async def get_collections(self):
-        collections = self.chroma_client.list_collections()
-        if int(self.collection_number) > 0:
-            collection_name = snake(self.agent_name)
-            collection_name = f"{collection_name}_{self.collection_number}"
-        else:
-            collection_name = self.collection_name
-        return [
-            collection
-            for collection in collections
-            if collection.startswith(collection_name)
-        ]
-
     async def get_collection(self):
+        """Emulate ChromaDB collection interface using SQL"""
+        session = get_session()
         try:
-            return self.chroma_client.get_collection(
-                name=self.collection_name, embedding_function=self.embedder
+            return SQLCollection(session, self)
+        except Exception as e:
+            logging.warning(f"Error getting collection: {e}")
+            return None
+
+    async def get_collections(self):
+        """Emulate ChromaDB collections listing using SQL"""
+        session = get_session()
+        try:
+            # Get distinct conversation IDs for this agent
+            conversations = (
+                session.query(Memory.conversation_id)
+                .filter_by(agent_id=self.agent_id)
+                .distinct()
+                .all()
             )
-        except:
-            self.chroma_client.create_collection(
-                name=self.collection_name,
-                embedding_function=self.embedder,
-            )
-            return self.chroma_client.get_collection(
-                name=self.collection_name, embedding_function=self.embedder
-            )
+
+            # Format collection names like ChromaDB expected them
+            prefix = get_user_collections_prefix(self.user)
+            collections = []
+
+            # Add collection "0" if it exists (core memories)
+            if (
+                session.query(Memory)
+                .filter_by(agent_id=self.agent_id, conversation_id=None)
+                .first()
+            ):
+                collections.append(f"{prefix}{snake(self.agent_name)}_0")
+
+            # Add conversation-specific collections
+            for (conv_id,) in conversations:
+                if conv_id:  # Skip None which represents collection "0"
+                    conv_hash = hash_user_id(conv_id, length=10)
+                    collections.append(f"{prefix}{snake(self.agent_name)}_{conv_hash}")
+
+            return collections
+        finally:
+            session.close()
 
     async def delete_memory(self, key: str):
         collection = await self.get_collection()
@@ -312,30 +641,87 @@ class Memories:
     async def write_text_to_memory(
         self, user_input: str, text: str, external_source: str = "user input"
     ):
-        collection = await self.get_collection()
-        if text:
-            if not isinstance(text, str):
-                text = str(text)
-            if self.summarize_content:
-                text = await self.summarize_text(text=text)
-            chunks = await self.chunk_content(text=text, chunk_size=self.chunk_size)
-            for chunk in chunks:
-                metadata = {
-                    "timestamp": datetime.now().isoformat(),
-                    "is_reference": str(False),
-                    "external_source_name": external_source,
-                    "description": user_input,
-                    "additional_metadata": chunk,
-                    "id": sha256(
-                        (chunk + datetime.now().isoformat()).encode()
-                    ).hexdigest(),
-                }
-                collection.add(
-                    ids=metadata["id"],
-                    metadatas=metadata,
-                    documents=chunk,
-                )
+        """Write text to memory with proper validation"""
+        if not self.agent_id:
+            logging.error(
+                f"No agent_id found for agent {self.agent_name} and user {self.user}"
+            )
+            return False
 
+        session = get_session()
+        try:
+            # Validate agent exists
+            agent = session.query(Agent).filter_by(id=self.agent_id).first()
+            if not agent:
+                logging.error(f"Agent not found with id {self.agent_id}")
+                return False
+
+            chunks = await self.chunk_content(text=text, chunk_size=self.chunk_size)
+
+            # Handle core memories vs conversation memories
+            conversation_id = (
+                None if self.collection_number == "0" else self.collection_number
+            )
+
+            # If replacing external source content, delete old entries
+            if external_source.startswith(("file", "http://", "https://")):
+                session.query(Memory).filter_by(
+                    agent_id=self.agent_id,
+                    conversation_id=conversation_id,
+                    external_source=external_source,
+                ).delete()
+
+            # Process all chunks first to ensure they're valid
+            memories_to_add = []
+            for chunk in chunks:
+                # Get embedding and ensure proper shape
+                try:
+                    chunk_embedding = embed([chunk])
+                    if not chunk_embedding or len(chunk_embedding) == 0:
+                        logging.warning(
+                            f"Failed to generate embedding for chunk: {chunk[:100]}..."
+                        )
+                        continue
+
+                    embedding = process_embedding_for_storage(chunk_embedding[0])
+
+                    memory = Memory(
+                        agent_id=self.agent_id,  # Explicitly set agent_id
+                        conversation_id=conversation_id,
+                        embedding=embedding,
+                        text=chunk,
+                        external_source=external_source,
+                        description=user_input,
+                        additional_metadata=chunk,
+                    )
+                    # Validate memory object
+                    if not memory.agent_id:
+                        logging.error("Memory created with null agent_id")
+                        continue
+
+                    memories_to_add.append(memory)
+                except Exception as e:
+                    logging.error(f"Error processing chunk: {str(e)}")
+                    continue
+
+            # Add all valid memories
+            if memories_to_add:
+                session.bulk_save_objects(memories_to_add)
+                session.commit()
+                logging.info(f"Successfully added {len(memories_to_add)} memories")
+                return True
+            else:
+                logging.warning("No valid memories to add")
+                return False
+
+        except Exception as e:
+            session.rollback()
+            logging.error(f"Error writing to memory: {e}")
+            return False
+        finally:
+            session.close()
+
+    # Update the get_memories_data method:
     async def get_memories_data(
         self,
         user_input: str,
@@ -343,72 +729,137 @@ class Memories:
         min_relevance_score: float = 0.0,
     ) -> List[dict]:
         if not user_input:
-            return ""
-        collection = await self.get_collection()
-        if collection == None:
-            return ""
-        embedding = array(self.embedding_provider.embeddings(user_input))
-        results = collection.query(
-            query_embeddings=embedding.tolist(),
-            n_results=limit,
-            include=["embeddings", "metadatas", "documents"],
-        )
-        embedding_array = array(results["embeddings"][0])
-        if len(embedding_array) == 0:
-            logging.warning("Embedding collection is empty.")
             return []
-        embedding_array = embedding_array.reshape(embedding_array.shape[0], -1)
-        if len(embedding.shape) == 2:
-            embedding = embedding.reshape(
-                embedding.shape[1],
-            )
-        similarity_score = compute_similarity_scores(
-            embedding=embedding, embedding_array=embedding_array
-        )
-        record_list = []
-        for record, score in zip(query_results_to_records(results), similarity_score):
-            record["relevance_score"] = score
-            record_list.append(record)
-        sorted_results = sorted(
-            record_list, key=lambda x: x["relevance_score"], reverse=True
-        )
-        filtered_results = [
-            x for x in sorted_results if x["relevance_score"] >= min_relevance_score
-        ]
-        top_results = filtered_results[:limit]
-        return top_results
 
+        session = get_session()
+        try:
+            query_embedding = embed([user_input])[0]
+            conversation_id = (
+                None if self.collection_number == "0" else self.collection_number
+            )
+
+            # Get similar memories using the new helper function
+            memory_results = get_similar_memories(
+                session,
+                query_embedding,
+                self.agent_id,
+                conversation_id,
+                limit,
+                min_relevance_score,
+            )
+
+            # Format results
+            memories = []
+            for memory, similarity in memory_results:
+                memories.append(
+                    {
+                        "external_source_name": memory.external_source,
+                        "id": str(memory.id),
+                        "key": str(memory.id),
+                        "description": memory.description,
+                        "text": memory.text,
+                        "embedding": (
+                            memory.embedding.tolist()
+                            if isinstance(memory.embedding, np.ndarray)
+                            else memory.embedding
+                        ),
+                        "additional_metadata": memory.additional_metadata,
+                        "timestamp": format_timestamp_iso(memory.timestamp),
+                        "relevance_score": float(similarity),
+                    }
+                )
+
+            return memories
+
+        finally:
+            session.close()
+
+    # Update the get_memories method similarly:
     async def get_memories(
         self,
         user_input: str,
         limit: int,
         min_relevance_score: float = 0.0,
     ) -> List[str]:
-        results = await self.get_memories_data(
-            user_input=user_input,
-            limit=limit,
-            min_relevance_score=min_relevance_score,
-        )
-        response = []
-        if results:
-            for result in results:
+        session = get_session()
+        try:
+            query_embedding = embed([user_input])[0]
+            conversation_id = (
+                None if self.collection_number == "0" else self.collection_number
+            )
+
+            # Get similar memories using the new helper function
+            memory_results = get_similar_memories(
+                session,
+                query_embedding,
+                self.agent_id,
+                conversation_id,
+                limit,
+                min_relevance_score,
+            )
+
+            # Format results
+            response = []
+            for memory, similarity in memory_results:
                 metadata = (
-                    result["additional_metadata"]
-                    if "additional_metadata" in result
-                    else ""
+                    memory.additional_metadata if memory.additional_metadata else ""
                 )
                 external_source = (
-                    result["external_source_name"]
-                    if "external_source_name" in result
-                    else None
+                    memory.external_source if memory.external_source else None
                 )
+                timestamp = format_timestamp(memory.timestamp)
+
                 if external_source:
-                    # If the external source is a url or a file path, add it to the metadata
-                    if external_source:
-                        metadata = f"Sourced from {external_source}:\n{metadata}"
+                    metadata = f"Sourced from {external_source}:\nSourced on: {timestamp}\n{metadata}"
+
                 if metadata not in response and metadata != "":
                     response.append(metadata)
-        return response
+
+            return response
+
+        finally:
+            session.close()
+
+    async def get_external_data_sources(self):
+        session = get_session()
+        try:
+            sources = (
+                session.query(Memory.external_source)
+                .filter_by(agent_id=self.agent_id)
+                .distinct()
+                .all()
+            )
+            return [source[0] for source in sources if source[0]]
+        finally:
+            session.close()
+
+    async def delete_memories_from_external_source(self, external_source: str):
+        session = get_session()
+        try:
+            if external_source.startswith("file"):
+                file_path = external_source.split(" ")[1]
+                file_path = os.path.normpath(file_path)
+                working_directory = os.path.normpath(getenv("WORKING_DIRECTORY"))
+                if file_path.startswith(working_directory):
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        logging.error(f"Error deleting file: {str(e)}")
+
+            result = (
+                session.query(Memory)
+                .filter_by(agent_id=self.agent_id, external_source=external_source)
+                .delete()
+            )
+
+            session.commit()
+            return bool(result)
+        except Exception as e:
+            session.rollback()
+            logging.error(f"Error deleting memories: {str(e)}")
+            return False
+        finally:
+            session.close()
 
     def score_chunk(self, chunk: str, keywords: set) -> int:
         """Score a chunk based on the number of query keywords it contains."""
@@ -422,9 +873,7 @@ class Memories:
         content_chunks = []
         chunk = []
         chunk_len = 0
-        keywords = [
-            token.text for token in doc if token.pos_ in {"NOUN", "PROPN", "VERB"}
-        ]
+        keywords = set(extract_keywords(doc=doc, limit=10))
         for sentence in sentences:
             sentence_tokens = len(sentence)
             if chunk_len + sentence_tokens > chunk_size and chunk:
@@ -446,183 +895,26 @@ class Memories:
         content_chunks.sort(key=lambda x: x[0], reverse=True)
         return [chunk_text for score, chunk_text in content_chunks]
 
-    async def get_context(
-        self,
-        user_input: str,
-        limit: int = 10,
-        websearch: bool = False,
-        additional_collections: List[str] = [],
-    ) -> str:
-        self.collection_number = 0
-        context = await self.get_memories(
-            user_input=user_input,
-            limit=limit,
-            min_relevance_score=0.2,
-        )
-        self.collection_number = 2
-        positive_feedback = await self.get_memories(
-            user_input=user_input,
-            limit=3,
-            min_relevance_score=0.7,
-        )
-        self.collection_number = 3
-        negative_feedback = await self.get_memories(
-            user_input=user_input,
-            limit=3,
-            min_relevance_score=0.7,
-        )
-        if positive_feedback or negative_feedback:
-            context += f"The users input makes you to remember some feedback from previous interactions:\n"
-            if positive_feedback:
-                context += f"Positive Feedback:\n{positive_feedback}\n"
-            if negative_feedback:
-                context += f"Negative Feedback:\n{negative_feedback}\n"
-        if websearch:
-            self.collection_number = 1
-            context += await self.get_memories(
-                user_input=user_input,
-                limit=limit,
-                min_relevance_score=0.2,
-            )
-        if additional_collections:
-            for collection in additional_collections:
-                self.collection_number = collection
-                context += await self.get_memories(
-                    user_input=user_input,
-                    limit=limit,
-                    min_relevance_score=0.2,
-                )
-        return context
+    async def get_transcription(self, video_id: str = None):
+        if "?v=" in video_id:
+            video_id = video_id.split("?v=")[1]
+        srt = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US"])
+        content = ""
+        for line in srt:
+            if line["text"] != "[Music]":
+                content += line["text"].replace("[Music]", "") + " "
+        return content
 
-    async def batch_prompt(
-        self,
-        user_inputs: List[str] = [],
-        prompt_name: str = "Ask Questions",
-        prompt_category: str = "Default",
-        batch_size: int = 10,
-        **kwargs,
-    ):
-        i = 0
-        tasks = []
-        responses = []
-        if user_inputs == []:
-            return []
-        for user_input in user_inputs:
-            i += 1
-            logging.info(f"[{i}/{len(user_inputs)}] Running Prompt: {prompt_name}")
-            if i % batch_size == 0:
-                responses += await asyncio.gather(**tasks)
-                tasks = []
-            task = asyncio.create_task(
-                await self.ApiClient.prompt_agent(
-                    agent_name=self.agent_name,
-                    prompt_name=prompt_name,
-                    prompt_args={
-                        "prompt_category": prompt_category,
-                        "user_input": user_input,
-                        **kwargs,
-                    },
-                )
+    async def write_youtube_captions_to_memory(self, video_id: str = None):
+        content = await self.get_transcription(video_id=video_id)
+        if content != "":
+            stored_content = (
+                f"Content from video at youtube.com/watch?v={video_id}:\n{content}"
             )
-            tasks.append(task)
-        responses += await asyncio.gather(**tasks)
-        return responses
-
-    # Answer a question with context injected, return in sharegpt format
-    async def agent_dpo_qa(self, question: str = "", context_results: int = 10):
-        context = await self.get_context(user_input=question, limit=context_results)
-        prompt = f"### Context\n{context}\n### Question\n{question}"
-        chosen = await self.ApiClient.prompt_agent(
-            agent_name=self.agent_name,
-            prompt_name="Answer Question with Memory",
-            prompt_args={
-                "prompt_category": "Default",
-                "user_input": question,
-                "context_results": context_results,
-            },
-        )
-        # Create a memory with question and answer
-        self.collection_number = 0
-        await self.write_text_to_memory(
-            user_input=question,
-            text=chosen,
-            external_source="Synthetic QA",
-        )
-        rejected = await self.ApiClient.prompt_agent(
-            agent_name=self.agent_name,
-            prompt_name="Wrong Answers Only",
-            prompt_args={
-                "prompt_category": "Default",
-                "user_input": question,
-            },
-        )
-        return prompt, chosen, rejected
-
-    # Creates a synthetic dataset from memories in sharegpt format
-    async def create_dataset_from_memories(
-        self, dataset_name: str = "", batch_size: int = 10
-    ):
-        self.agent_config["settings"]["training"] = True
-        self.ApiClient.update_agent_settings(
-            agent_name=self.agent_name, settings=self.agent_config["settings"]
-        )
-        memories = []
-        questions = []
-        if dataset_name == "":
-            dataset_name = f"{datetime.now().isoformat()}-dataset"
-        collections = await self.get_collections()
-        for collection in collections:
-            self.collection_name = collection
-            memories += await self.export_collection_to_json()
-        logging.info(f"There are {len(memories)} memories.")
-        memories = [memory["text"] for memory in memories]
-        # Get a list of questions about each memory
-        question_list = self.batch_prompt(
-            user_inputs=memories,
-            batch_size=batch_size,
-        )
-        for question in question_list:
-            # Convert the response to a list of questions
-            question = question.split("\n")
-            question = [
-                item.lstrip("0123456789.*- ") for item in question if item.lstrip()
-            ]
-            question = [item for item in question if item]
-            question = [item.lstrip("0123456789.*- ") for item in question]
-            questions += question
-        prompts = []
-        good_answers = []
-        bad_answers = []
-        for question in questions:
-            prompt, chosen, rejected = await self.agent_dpo_qa(
-                question=question, context_results=10
+            await self.write_text_to_memory(
+                user_input=video_id,
+                text=stored_content,
+                external_source=f"From YouTube video: {video_id}",
             )
-            prompts.append(prompt)
-            good_answers.append(
-                [
-                    {"content": prompt, "role": "user"},
-                    {"content": chosen, "role": "assistant"},
-                ]
-            )
-            bad_answers.append(
-                [
-                    {"content": prompt, "role": "user"},
-                    {"content": rejected, "role": "assistant"},
-                ]
-            )
-        dpo_dataset = {
-            "prompt": questions,
-            "chosen": good_answers,
-            "rejected": bad_answers,
-        }
-        # Save messages to a json file to be used as a dataset
-        os.makedirs(f"./WORKSPACE/{self.agent_name}/datasets", exist_ok=True)
-        with open(
-            f"./WORKSPACE/{self.agent_name}/datasets/{dataset_name}.json", "w"
-        ) as f:
-            f.write(json.dumps(dpo_dataset))
-        self.agent_config["settings"]["training"] = False
-        self.ApiClient.update_agent_settings(
-            agent_name=self.agent_name, settings=self.agent_config["settings"]
-        )
-        return dpo_dataset
+            return True
+        return False
